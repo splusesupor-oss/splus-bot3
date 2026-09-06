@@ -1,0 +1,63 @@
+# Python runtime artifacts
+__pycache__/
+*.pyc
+*.pyo
+*.pyd
+*.py[cod]
+*$py.class
+.pytest_cache/
+.mypy_cache/
+
+# Runtime logs and client sessions
+logs/
+*.session
+*.session-*
+
+# Runtime-persisted feature data
+config/group_memory.json
+config/group_rules.json
+config/group_message_lock_state.json
+config/name_family_learning.json
+config/fox_lucky_box.json
+
+# Economy runtime data — belongs to each device, never to the repo.
+# Tracking it made a pull try to overwrite real user balances.
+config/economy.json
+config/economy_shop.json
+config/economy_settings.json
+
+# قابلیت‌های جدید: state runtime — روی هر دستگاه جدا ساخته می‌شود
+config/fox_minesweeper.json
+config/sentence_guess_state.json
+config/group_level.json
+config/user_history.json
+
+# Runtime logs and data
+logs/
+*.log
+
+# Runtime config data
+config/*.json
+
+# Python cache
+__pycache__/
+*.pyc
+
+# Environment
+.env
+logs/
+config/notice_cleanup.json
+config/*.json
+__pycache__/
+*.pyc
+config/notice_cleanup.json
+
+# runtime files
+backups/runtime/
+config/tmp*.tmp
+config/watchdog.lock
+config/watchdog_pending.json
+logs/
+
+# تمام نسخه‌های .env (بکاپ‌ها و نسخه‌های قدیمی) — هرگز commit نشوند
+.env*
