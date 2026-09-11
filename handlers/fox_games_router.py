@@ -39,6 +39,7 @@ from modules.fox_games.session_core import (
     normalize_text,
     to_persian_digits,
 )
+from modules import entertainment_control
 
 # دستورهایی که این روتر مالک آن‌هاست.
 FOX_GAME_COMMANDS = frozenset({
@@ -1186,6 +1187,11 @@ async def handle(bot, event, chat_id, user_id, sender, text, logger=None):
     }
 
     if command in start_games:
+        # گارد لایهٔ دوم: حتی اگر این روتر از مسیری غیر از هندلر اصلی صدا زده
+        # شود، بازیِ خاموش اجرا نمی‌شود. قبل از هر ساخت state یا تایمر.
+        if await entertainment_control.guard(event, chat_id, text):
+            log(logger, f"FOX GAME BLOCKED chat_id={chat_id} command={command!r}")
+            return True
         game_module, starter = start_games[command]
         if not game_module.is_active(chat_id):
             if active_game_count(chat_id) >= MAX_ACTIVE_GAMES_PER_CHAT:

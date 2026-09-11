@@ -135,6 +135,7 @@ from modules.outgoing_profiler import (
 )
 from handlers.admin_handler import handle_admin_commands
 from modules import admin_tools
+from modules import entertainment_control
 from modules.group_dispatch import PRIORITY_ADMIN, classify_priority
 # 🗂 سیستم سابقه‌ها و 🏆 سطح گروه — دو قابلیتِ مستقل با فایل و ماژولِ جدا.
 from modules import user_history
@@ -4568,6 +4569,37 @@ async def handle_new_message(bot, event):
         if await handle_photo_download(
             bot, event, chat_id, user_id, sender, clean_text, bot.logger
         ):
+            return
+
+        # ---- 🎮 کنترل سرگرمی به تفکیک گروه (روشن/خاموش بازی‌های داخلی) ----
+        # ۱) شاخهٔ توگل: فقط مالک اصلی ربات، مالک گروه یا ادمین ثبت‌شده.
+        if clean_text in entertainment_control.COMMANDS:
+            bot.logger.log_info(
+                "HANDLER CALLED handler=entertainment_control "
+                f"command={clean_text!r} chat_id={chat_id}"
+            )
+            if event.is_private:
+                await event.reply(entertainment_control.PRIVATE_ONLY)
+                return
+            if not admin_tools.has_admin_permission(
+                chat_id, user_id, getattr(sender, "username", None)
+            ):
+                await event.reply(entertainment_control.PERMISSION_DENIED)
+                return
+            if clean_text == entertainment_control.COMMAND_DISABLE:
+                entertainment_control.disable(chat_id)
+                await entertainment_control.send_disabled_notice(event)
+            else:
+                entertainment_control.enable(chat_id)
+                await entertainment_control.send_enabled_notice(event)
+            return
+
+        # ۲) گارد مرکزی — هر بازی داخلی از همین یک نقطه رد می‌شود.
+        # دستور «لیست بازی» عمداً گارد نمی‌شود (در GAME_COMMANDS نیست).
+        if await entertainment_control.guard(event, chat_id, clean_text):
+            bot.logger.log_info(
+                f"ENTERTAINMENT BLOCKED chat_id={chat_id} command={clean_text!r}"
+            )
             return
 
         # ---- 🦊 سیستم اختصاصی ورود به سایت بازی روباه (Fox Game Center) ----
