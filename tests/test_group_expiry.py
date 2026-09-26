@@ -304,7 +304,14 @@ def test_confirmation_message():
     check("blockquote و bold روی یک بازه‌اند",
           fragments[0] == fragments[1] and fragments[2] == fragments[3])
     check("تاریخ فعال‌سازی و انقضا متفاوت‌اند", fragments[0] != fragments[2])
-    check("ارقام فارسی هستند", any(d in fragments[0] for d in "۰۱۲۳۴۵۶۷۸۹"))
+    # رقم‌ها عمداً به‌صورت بُلد ریاضی نمایش داده می‌شوند (نه ASCII و نه
+    # فارسی ساده) تا در پیام سروش پلاس برجسته دیده شوند.
+    check("ارقام بُلد ریاضی هستند",
+          any(d in fragments[0] for d in "𝟬𝟭𝟮𝟯𝟰𝟱𝟲𝟳𝟴𝟵"), fragments[0])
+    check("رقم ASCII در تاریخ نیست",
+          not any(d in fragments[0] for d in "0123456789"), fragments[0])
+    check("رقم فارسیِ ساده در تاریخ نیست",
+          not any(d in fragments[0] for d in "۰۱۲۳۴۵۶۷۸۹"), fragments[0])
 
 
 def test_expired_message():
@@ -480,7 +487,60 @@ def test_watcher_survives_send_failure():
     check("گروه با وجود شکست ارسال، غیرفعال شد", len(deactivated) == 1)
     check("گروه شمرده شد", closed == 1)
     check("شکست ارسال لاگ شد", bot.logger.has("NOTICE FAILED"))
-    check("گروه دوباره اعلام نمی‌شود", ge.was_notified(CHAT))
+    # تلاش اول ناموفق بود؛ هنوز کران نرسیده پس یک دور دیگر تلاش می‌شود.
+    check("پس از یک شکست، تلاش ثبت شد", ge.notice_attempts(CHAT) == 1)
+    check("دورِ بعد دوباره تلاش می‌شود", not ge.was_notified(CHAT))
+    check("دورِ بعد در فهرست گروه‌های منقضی هست",
+          any(key == str(abs(CHAT) - 1000000000000)
+              for key, _ in ge.due_groups()))
+
+    # تلاش‌های بعدی تا رسیدن به سقف
+    while ge.notice_attempts(CHAT) < ge.MAX_NOTICE_ATTEMPTS:
+        bot = Bot(Client(fail=True))
+        asyncio.run(geh.check_once(
+            bot, lambda c, t: deactivated.append(c), logger=bot.logger))
+
+    check("تعداد تلاش به سقف رسید",
+          ge.notice_attempts(CHAT) == ge.MAX_NOTICE_ATTEMPTS,
+          f"-> {ge.notice_attempts(CHAT)}")
+    check("پس از سقف، دیگر تلاشی نمی‌شود", ge.was_notified(CHAT))
+    check("پس از سقف گروه از فهرست اعلام بیرون می‌رود",
+          ge.due_groups() == [], f"-> {ge.due_groups()}")
+    check("گروه همچنان غیرفعال/منقضی است", ge.is_expired(CHAT))
+    check("تسلیم شدن لاگ شد", bot.logger.has("EXPIRY NOTICE GIVE UP"))
+
+    # تمدید اشتراک: شمارنده صفر می‌شود و گروه دوباره شانس اعلام دارد.
+    ge.set_expiry(CHAT, "یک هفته", now=past)
+    check("پس از تمدید شمارندهٔ تلاش صفر شد",
+          ge.notice_attempts(CHAT) == 0)
+    check("پس از تمدید دوباره در فهرست اعلام هست",
+          len(ge.due_groups()) == 1)
+
+
+def test_watcher_gives_up_immediately_when_group_is_gone():
+    print("\n### 🤖 گروه حذفشده: بدون تلاشِ اضافه")
+    use_temp_file()
+    past = datetime(2026, 7, 1, tzinfo=timezone.utc)
+    ge.set_expiry(CHAT, "یک هفته", now=past)
+
+    class GoneClient:
+        def __init__(self):
+            self.sent = []
+
+        async def send_message(self, target, text, **kwargs):
+            raise RuntimeError("404 channel not found")
+
+    deactivated = []
+    bot = Bot(GoneClient())
+    closed = asyncio.run(geh.check_once(
+        bot, lambda c, t: deactivated.append(c), logger=bot.logger))
+
+    check("گروه غیرفعال شد", len(deactivated) == 1)
+    check("گروه شمرده شد", closed == 1)
+    check("بدون صرفِ سقف تلاش، اعلام بسته شد", ge.was_notified(CHAT))
+    check("تلاش اضافه‌ای ثبت نشد", ge.notice_attempts(CHAT) == 0)
+    check("حذف هدف لاگ شد",
+          bot.logger.has("EXPIRY TARGET INVALID REMOVED"))
 
 
 def test_watcher_loop_runs():
@@ -597,8 +657,18 @@ def test_full_independence():
           f"-> {sorted(imported)}")
     import re as _re
     _internal = _re.findall(r"from\s+modules\.([\w.]+)\s+import", source)
-    check("تنها ماژولِ داخلیِ پروژه time_utils (مرکزیِ زمان) است",
-          set(_internal) <= {"time_utils"}, f"-> {_internal}")
+    # وابستگی‌های داخلیِ مجاز:
+    #   time_utils    — منبع مرکزی زمان/timezone
+    #   runtime_paths — مسیرِ runtime هر instance (BOT_INSTANCE=bot3 و…)؛
+    #                   بدون آن group_expiry.json بین instanceها قاطی می‌شد.
+    # هیچ‌کدام بازی، حافظه، قفل، سکه یا storage گروه نیست، پس استقلالِ
+    # این قابلیت دست‌نخورده می‌ماند.
+    check("تنها وابستگی داخلی، زمان و مسیرِ runtime است",
+          set(_internal) <= {"time_utils", "runtime_paths"},
+          f"-> {_internal}")
+    check("هیچ سیستم دیگری (بازی/حافظه/قفل/سکه) import نمی‌شود",
+          not (set(_internal)
+               - {"time_utils", "runtime_paths"}), f"-> {_internal}")
 
     check("فایل ذخیره‌سازی اختصاصی است",
           ge.FILE.name == "group_expiry.json"
@@ -673,6 +743,7 @@ def main():
     test_reactivation()
     test_watcher_deactivates()
     test_watcher_survives_send_failure()
+    test_watcher_gives_up_immediately_when_group_is_gone()
     test_watcher_loop_runs()
     test_end_to_end_lifecycle()
     test_full_independence()

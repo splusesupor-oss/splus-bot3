@@ -53,6 +53,20 @@ SET_HEADER = "✅ تاریخ انقضای گروه تنظیم شد."
 ACTIVATED_LABEL = "📅 تاریخ فعال‌سازی:"
 EXPIRES_LABEL = "⏳ تاریخ انقضا:"
 
+# --- دستور «مهلت گروه» ---------------------------------------------------
+# تنها یک دستور گزارش‌گیری؛ با تطبیق دقیق، پس با هیچ دستور دیگری تداخل
+# ندارد. مقدار باقی‌مانده همیشه از رکورد واقعی همان گروه محاسبه می‌شود.
+STATUS_COMMAND = "مهلت گروه"
+STATUS_LINE_PREFIX = "↻- "
+STATUS_GROUP_LABEL = "گروه"
+STATUS_REMAINING_LABEL = "مهلت باقی مانده"
+STATUS_RENEW_LINE = "برای تمدید اشتراک : 𝄞 @aifox_bot"
+
+# مقدارهای نمایشی وقتی رکوردی وجود ندارد یا مهلت تمام شده است.
+NO_EXPIRY_TEXT = "ثبت نشده"
+EXPIRED_STATUS_TEXT = "منقضی شده"
+FALLBACK_GROUP_TITLE = "گروه بدون نام"
+
 _cache = None
 _cache_mtime = None
 
@@ -90,6 +104,15 @@ def match_command(text):
 
 def duration_days(command):
     return DURATIONS.get(normalize_command(command))
+
+
+def match_status_command(text):
+    """آیا متن *دقیقاً* دستور «مهلت گروه» است.
+
+    مثل بقیهٔ دستورهای این ماژول تطبیق کامل است؛ «مهلت گروه من» یا
+    «گرفتن مهلت گروه» تطبیق نمی‌کنند.
+    """
+    return normalize_command(text) == STATUS_COMMAND
 
 
 # ---------------------------------------------------------------------------
@@ -169,6 +192,18 @@ def reset_all():
         FILE.unlink()
     except OSError:
         pass
+
+
+def refresh_caches():
+    """کش حافظه را دور می‌ریزد تا خواندن بعدی مستقیم از فایل باشد.
+
+    همگام‌سازی دوره‌ای «لیست انقضا» از این استفاده می‌کند تا حتی اگر
+    فایل توسط مسیر دیگری نوشته شده باشد، گزارش وضعیتِ واقعی را نشان
+    دهد. هیچ داده‌ای پاک نمی‌شود؛ فقط کش بی‌اعتبار می‌شود.
+    """
+    global _cache, _cache_mtime
+    _cache = None
+    _cache_mtime = None
 
 
 # ---------------------------------------------------------------------------
@@ -318,9 +353,74 @@ def clear_expiry(group_id):
     return True
 
 
+def update_title(group_id, title):
+    """فقط عنوانِ رکورد موجود را به‌روز می‌کند.
+
+    برای گروهی که رکورد انقضا ندارد هیچ رکوردی ساخته نمی‌شود و به
+    هیچ فیلد دیگری (تاریخ‌ها، ``notified``) دست نمی‌زند؛ پس تغییر نام
+    گروه هرگز اشتراک را جابه‌جا یا پاک نمی‌کند. خروجی: True اگر عنوان
+    واقعاً تغییر کرد.
+    """
+    title = str(title or "").strip()
+    if not title:
+        return False
+    data = _load()
+    key = _group_key(group_id)
+    record = data.get(key)
+    if not isinstance(record, dict):
+        return False
+    if str(record.get("title") or "").strip() == title:
+        return False
+    data = dict(data)
+    updated = dict(record)
+    updated["title"] = title
+    data[key] = updated
+    _save(data)
+    return True
+
+
 def was_notified(group_id):
     record = get_record(group_id)
     return bool(record and record.get("notified"))
+
+
+# سقف تلاش برای ارسال پیامِ «گروه غیرفعال شد». بعد از این تعداد، دیگر
+# تلاشی نمی‌شود: گروه سرِ لحظهٔ انقضا خاموش شده و کارِ ربات در آن تمام
+# است، پس تکرار بی‌پایانِ ارسال فقط RPC و لاگ اضافه می‌کند.
+MAX_NOTICE_ATTEMPTS = 3
+
+
+def notice_attempts(group_id):
+    """تعداد تلاش‌های ناموفقِ ارسال پیام انقضا برای این گروه."""
+    record = get_record(group_id)
+    try:
+        return int((record or {}).get("notify_attempts") or 0)
+    except (TypeError, ValueError):
+        return 0
+
+
+def record_notice_attempt(group_id):
+    """یک تلاشِ ناموفقِ ارسال را ثبت می‌کند و تعداد کل را برمی‌گرداند.
+
+    با تمدید اشتراک (``set_expiry``) رکورد از نو ساخته می‌شود، پس این
+    شمارنده هم صفر می‌شود و گروهِ تمدیدشده دوباره شانس اعلام دارد.
+    """
+    data = _load()
+    key = _group_key(group_id)
+    record = data.get(key)
+    if not isinstance(record, dict):
+        return 0
+    data = dict(data)
+    updated = dict(record)
+    try:
+        attempts = int(updated.get("notify_attempts") or 0)
+    except (TypeError, ValueError):
+        attempts = 0
+    attempts += 1
+    updated["notify_attempts"] = attempts
+    data[key] = updated
+    _save(data)
+    return attempts
 
 
 def mark_notified(group_id):
@@ -394,3 +494,87 @@ def build_expired_message():
     """متن غیرفعال‌سازی خودکار، کاملاً Bold."""
     text = EXPIRED_MESSAGE
     return text, [("bold", 0, _u16(text))]
+
+
+# ---------------------------------------------------------------------------
+# ⏳ دستور «مهلت گروه» — گزارش باقی‌مانده از رکورد واقعی همان گروه
+# ---------------------------------------------------------------------------
+_PERSIAN_DIGITS = str.maketrans("0123456789", "۰۱۲۳۴۵۶۷۸۹")
+
+
+def _digits(value):
+    return str(value).translate(_PERSIAN_DIGITS)
+
+
+def title_of(group_id):
+    """عنوان ذخیره‌شده در رکورد انقضا (یا None)."""
+    record = get_record(group_id)
+    if not record:
+        return None
+    title = str(record.get("title") or "").strip()
+    return title or None
+
+
+def format_remaining(expires, now=None):
+    """«۳ روز و ۶ ساعت» — و ``None`` اگر مهلت تمام شده یا مقدار نامعتبر است.
+
+    تنها منبع محاسبهٔ مدت باقی‌مانده در کل پروژه؛ گزارش «لیست انقضا» هم
+    از همین تابع استفاده می‌کند تا دو مسیر هرگز عدد متفاوت ندهند.
+    """
+    if expires is None:
+        return None
+    seconds = int((expires - (now or _now())).total_seconds())
+    if seconds <= 0:
+        return None
+    days, remainder = divmod(seconds, 24 * 60 * 60)
+    hours, remainder = divmod(remainder, 60 * 60)
+    minutes = remainder // 60
+    parts = []
+    if days:
+        parts.append(f"{_digits(days)} روز")
+    if hours or days:
+        parts.append(f"{_digits(hours)} ساعت")
+    if not days and not hours:
+        parts.append(f"{_digits(minutes)} دقیقه")
+    return " و ".join(parts)
+
+
+def remaining_text(group_id, now=None):
+    """متن آمادهٔ نمایش برای «مهلت باقی مانده».
+
+    همیشه از رکورد واقعی همان گروه محاسبه می‌شود؛ هیچ مقدار ثابت یا
+    کش‌شده‌ای برگردانده نمی‌شود:
+      • رکورد ندارد            → «ثبت نشده»
+      • مهلت تمام شده         → «منقضی شده»
+      • در حال اعتبار          → «۳ روز و ۶ ساعت»
+    """
+    ends = expires_at(group_id)
+    if ends is None:
+        return NO_EXPIRY_TEXT
+    return format_remaining(ends, now) or EXPIRED_STATUS_TEXT
+
+
+def build_status_message(title, remaining):
+    """متن و entity های دستور «مهلت گروه».
+
+    قالب دقیق:
+
+        ↻- گروه : [نام گروه]
+        مهلت باقی مانده : [مدت باقی‌مانده]
+        برای تمدید اشتراک : 𝄞 @aifox_bot
+
+    فقط دو برچسب «گروه» و «مهلت باقی مانده» Bold می‌شوند و عمداً هیچ
+    نقل‌قول شیشه‌ای (blockquote) ساخته نمی‌شود. جای برچسب‌ها از پیشوند
+    ساخته‌شده محاسبه می‌شود، نه با جست‌وجو در متن؛ پس اگر نام گروه خودش
+    کلمهٔ «گروه» داشته باشد هم فقط برچسب Bold می‌شود.
+    """
+    clean_title = str(title or "").strip() or FALLBACK_GROUP_TITLE
+    clean_remaining = str(remaining or "").strip() or NO_EXPIRY_TEXT
+    first_line = f"{STATUS_LINE_PREFIX}{STATUS_GROUP_LABEL} : {clean_title}"
+    second_line = f"{STATUS_REMAINING_LABEL} : {clean_remaining}"
+    text = f"{first_line}\n{second_line}\n{STATUS_RENEW_LINE}"
+    spans = [
+        ("bold", _u16(STATUS_LINE_PREFIX), _u16(STATUS_GROUP_LABEL)),
+        ("bold", _u16(first_line + "\n"), _u16(STATUS_REMAINING_LABEL)),
+    ]
+    return text, spans
