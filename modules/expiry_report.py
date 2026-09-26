@@ -27,21 +27,30 @@ def _digits(value):
 
 
 def _remaining_text(expires_at, now):
-    """Format an aware UTC expiry moment without timezone-dependent rounding."""
-    seconds = int((expires_at - now).total_seconds())
-    if seconds <= 0:
-        return None
-    days, remainder = divmod(seconds, 24 * 60 * 60)
-    hours, remainder = divmod(remainder, 60 * 60)
-    minutes = remainder // 60
-    parts = []
-    if days:
-        parts.append(f"{_digits(days)} روز")
-    if hours or days:
-        parts.append(f"{_digits(hours)} ساعت")
-    if not days and not hours:
-        parts.append(f"{_digits(minutes)} دقیقه")
-    return " و ".join(parts)
+    """Format an aware UTC expiry moment without timezone-dependent rounding.
+
+    تنها پیاده‌سازی محاسبهٔ باقی‌مانده در ``modules.group_expiry`` است؛
+    این تابع فقط همان را صدا می‌زند تا گزارش و دستور «مهلت گروه» هرگز
+    عدد متفاوتی نشان ندهند.
+    """
+    return group_expiry.format_remaining(expires_at, now)
+
+
+def _refresh_sources():
+    """کش هر دو storage را بی‌اعتبار می‌کند تا گزارش از خودِ فایل بخواند.
+
+    بدون این کار، گزارشی که در یک پروسِ بلندمدت ساخته می‌شود می‌توانست
+    وضعیت قدیمی را نشان دهد؛ حالا هر «لیست انقضا» وضعیت لحظه‌ای است.
+    """
+    try:
+        group_expiry.refresh_caches()
+    except Exception:
+        pass
+    try:
+        group_storage._cache = None
+        group_storage._cache_mtime = None
+    except Exception:
+        pass
 
 
 def _sources(logger):
@@ -66,13 +75,20 @@ def _moment(now):
 
 
 def build_report(logger=None, now=None):
-    """Build the detailed legacy expiry report (used by the existing private route)."""
+    """Build the detailed legacy expiry report (used by the existing private route).
+
+    گزارش همیشه از وضعیتِ لحظه‌ای ساخته می‌شود: کش هر دو storage قبل از
+    ساخت بی‌اعتبار می‌شود، پس گروه تمدیدشده با تاریخ جدید و گروه
+    منقضی‌شده با وضعیت واقعی دیده می‌شود — نه با مقدار قدیمی.
+    """
     moment = _moment(now)
+    _refresh_sources()
     groups, expiry_records = _sources(logger)
     if not groups:
         return _HEADER + "\n\nℹ️ هیچ گروه ثبت‌شده‌ای وجود ندارد."
 
     rows = [_HEADER]
+    expired_count = 0
     for index, (group_id, group) in enumerate(groups.items(), 1):
         group = group if isinstance(group, dict) else {}
         record = group_expiry.get_record(group_id)
@@ -81,7 +97,10 @@ def build_report(logger=None, now=None):
             or str((record or {}).get("title") or "").strip()
             or "گروه بدون نام"
         )
-        prefix = "❌" if record and group_expiry.is_expired(group_id, now=moment) else f"{_digits(index)}️⃣"
+        expired = bool(record) and group_expiry.is_expired(group_id, now=moment)
+        if expired:
+            expired_count += 1
+        prefix = "❌" if expired else f"{_digits(index)}️⃣"
         lines = [f"{prefix} گروه: {title}", f"🆔 شناسه: {group_id}"]
         if not record:
             lines.append("⏳ وضعیت: تاریخ انقضا ثبت نشده")
@@ -95,13 +114,29 @@ def build_report(logger=None, now=None):
                 remaining = _remaining_text(expires, moment)
                 lines.append("⏳ وضعیت: منقضی شده" if remaining is None
                              else f"⏳ باقی‌مانده: {remaining}")
+                # تاریخ واقعیِ همان رکورد؛ پس گروه تمدیدشده دیگر با تاریخ
+                # منقضی‌شدهٔ قبلی نمایش داده نمی‌شود.
+                lines.append(
+                    f"📅 تاریخ انقضا: {group_expiry.format_datetime(expires)}")
+        # وضعیت واقعی ربات در گروه، تا گروهِ بسته‌شده «فعال» به نظر نرسد.
+        bot_active = bool(group.get("active")) and not expired
+        lines.append(
+            "🔌 ربات در گروه: فعال" if bot_active else "🔌 ربات در گروه: خاموش")
         rows.append("\n".join(lines))
 
     registered_keys = {str(key) for key in groups}
+    orphan_count = 0
     for expiry_key in expiry_records:
         if str(expiry_key) not in registered_keys:
+            orphan_count += 1
             _log_error(logger, "EXPIRY REPORT ORPHAN RECORD "
                        f"group_id={expiry_key!r} reason=not_in_groups_storage")
+    rows.append(
+        f"🔄 همگام‌سازی: {_digits(len(groups))} گروه | "
+        f"{_digits(expired_count)} منقضی | "
+        f"{_digits(orphan_count)} رکورد بدون گروه"
+        + (f"\n🕒 زمان گزارش: {group_expiry.format_datetime(moment)}")
+    )
     return "\n\n".join(rows)
 
 

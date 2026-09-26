@@ -58,6 +58,8 @@ from handlers.group_expiry_handler import (
     EXPIRED_NOTICE as GROUP_EXPIRED_NOTICE,
     blocks_message as group_expiry_blocks,
     handle as handle_group_expiry,
+    handle_status as handle_group_expiry_status,
+    sync_title_from_event as sync_group_expiry_title,
 )
 from modules.expiry_report import build_group_list
 from modules.name_family import (
@@ -3484,6 +3486,40 @@ async def handle_new_message(bot, event):
                 f"chat_id={chat_id} user_id={user_id} message_id={event.message.id}"
             )
             return
+        # ------------------------------------------------------------------
+        # ⏳ مهلت گروه — گیتِ زودهنگام، پیش از هر دستور و قابلیت دیگری.
+        #
+        # ۱) نام فعلی گروه با اولین پیام بعد از تغییر نام به‌روز می‌شود
+        #    (از کشِ خود رویداد؛ بدون RPC اضافه روی مسیر داغ).
+        # ۲) دستور «مهلت گروه» برای مالک/ادمین همان گروه پاسخ می‌گیرد؛
+        #    مقدار همیشه از رکورد واقعی انقضای همان گروه محاسبه می‌شود.
+        # ۳) گروه منقضی: هیچ دستور یا قابلیت عادی اجرا نمی‌شود. فقط مالک
+        #    اصلی عبور می‌کند تا بتواند اشتراک را تمدید کند.
+        #
+        # انقضا با is_expired و سرِ لحظهٔ واقعی سنجیده می‌شود؛ پس نه
+        # ری‌استارت، نه تغییر نام گروه و نه تمدید، این گیت را جابه‌جا
+        # نمی‌کند و گروه دقیقاً در زمان انقضا خاموش می‌شود.
+        # ------------------------------------------------------------------
+        if not event.is_private:
+            try:
+                await sync_group_expiry_title(event, chat_id, bot.logger)
+            except Exception as expiry_title_error:
+                bot.logger.log_error(
+                    "GROUP EXPIRY TITLE SYNC FAILED "
+                    f"chat_id={chat_id} error={expiry_title_error!r}"
+                )
+            if await handle_group_expiry_status(
+                bot, event, chat_id, sender, clean_text, bot.logger,
+                allow=registered_admin_bypass or native_admin_bypass,
+            ):
+                return
+            if group_expiry_blocks(chat_id, sender):
+                bot.logger.log_info(
+                    "GROUP EXPIRY BLOCKED "
+                    f"chat_id={chat_id} user_id={user_id} "
+                    f"command={clean_text!r} reason=group_expired"
+                )
+                return
         # Normalize only the routing copy; keep message_text unchanged for filters.
         # COMMAND_MATCH is the cheap text classify only — never include
         # get_entity / search / economy time in this stage.
@@ -5487,6 +5523,14 @@ async def handle_new_message(bot, event):
                 "🎮 برای روشن کردن بازی های روباه\n\n"
                 "سرگرمی فعال"
             )
+            # ⏳ مهلت گروه — کل این بخش Bold و داخل یک نقل‌قول شیشهٔ یکپارچه.
+            # در راهنمای ادمین‌ها («لیست ادمینی») دیده می‌شود و مشخص است که
+            # فقط مدیر یا مالک اجازهٔ استفاده از این دستور را دارد.
+            expiry_help_block = (
+                "⏳ مهلت گروه (فقط مدیر یا مالک):\n"
+                "برای دیدن مهلت باقی مانده گروه\n"
+                "بنویسید مهلت گروه"
+            )
             full_help_text = (
                 "📌 راهنمای روباه\n\n"
 
@@ -5687,6 +5731,8 @@ async def handle_new_message(bot, event):
                 "🗑️ حذف اخطار:\n"
                 "برای حذف اخطار داده‌شده به یک کاربر\n"
                 "«روی پیام کاربر ریپلای کنید و بنویسید \"حذف اخطار\"»\n\n"
+                + expiry_help_block +
+                "\n\n"
                 "با سازنده ربات تماس بگیرید:\n"
                 "@osine2"
             )
@@ -5846,6 +5892,8 @@ async def handle_new_message(bot, event):
                 "صفر کردن تخلفات توسط مالک اصلی ربات یا مالک گروه",
                 "🗑️ حذف اخطار:",
                 "برای حذف اخطار داده‌شده به یک کاربر",
+                # ⏳ مهلت گروه — تمام این بخش Bold است.
+                expiry_help_block,
             ]
             # هر تکه ممکن است چند بار در متن بیاید (مثل «حذف اسم:» که هم
             # عنوان است هم دستور)؛ فقط جایگاه‌های واقعی علامت می‌خورند.
@@ -5935,7 +5983,9 @@ async def handle_new_message(bot, event):
                 "برای دیدن لیست vip ها بنویسید\n\n"
                 "لیست vip"
             )
-            for section in quote_sections + [vip_help_section]:
+            # ⏳ کل بخش «مهلت گروه» هم یک نقل‌قول شیشه‌ای یکپارچه است.
+            for section in quote_sections + [vip_help_section,
+                                     expiry_help_block]:
                 pos = help_text.find(section)
                 if pos != -1:
                     entities.append(

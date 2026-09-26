@@ -19,7 +19,10 @@ from modules.group_expiry import match_command as expiry_command
 from modules.expiry_report import build_report as build_expiry_report
 from modules.admin_tools import run_cleanup_watcher
 from handlers.group_expiry_handler import (
+    EXPIRY_LIST_SYNC_SECONDS as GROUP_EXPIRY_LIST_SYNC_SECONDS,
+    run_expiry_list_sync as run_group_expiry_list_sync,
     run_expiry_watcher as run_group_expiry_watcher,
+    sync_expiry_list as sync_group_expiry_list,
 )
 from modules.banned_storage import (
     add_banned,
@@ -1133,6 +1136,22 @@ class SoroushAntiSpamBot:
 
         asyncio.create_task(group_expiry_loop())
 
+        # 🔄 همگام‌سازی دوره‌ای «لیست انقضا» — هر ۲۴ ساعت یک‌بار.
+        #
+        # فقط خودِ لیست را با وضعیت واقعی گروه‌ها یکی می‌کند (حذف رکوردهای
+        # بی‌گروه، به‌روزرسانی نام و وضعیت گروه‌های تمدیدشده). انقضای
+        # واقعی گروه هرگز منتظر این حلقه نمی‌ماند: ناظرِ انقضا و گیتِ
+        # is_expired در مسیر پیام، سرِ زمانِ واقعی ربات را خاموش می‌کنند.
+        async def group_expiry_list_sync_loop():
+            self.logger.log_info(
+                "EXPIRY LIST SYNC LOOP START "
+                f"interval_s={GROUP_EXPIRY_LIST_SYNC_SECONDS}"
+            )
+            await run_group_expiry_list_sync(
+                interval=GROUP_EXPIRY_LIST_SYNC_SECONDS, logger=self.logger)
+
+        asyncio.create_task(group_expiry_list_sync_loop())
+
         # 🧹 ناظر پاکسازی خودکار — در ساعتِ تنظیم‌شده، پیام‌های گروه را پاک می‌کند.
         if not hasattr(self, "cleanup_tasks"):
             self.cleanup_tasks = {}
@@ -2197,6 +2216,24 @@ class SoroushAntiSpamBot:
                     # اصلی به آن دسترسی دارد و هرگز وارد مسیر گروه/بازی نمی‌شود.
                     if text == "لیست انقضا":
                         if _owner_ok:
+                            try:
+                                # قبل از ساخت گزارش، لیست با وضعیت واقعی
+                                # گروه‌ها همگام می‌شود تا گروه تمدیدشده با
+                                # تاریخ جدید و گروه منقضی‌شده با وضعیت درست
+                                # دیده شود (نه اطلاعات قدیمی).
+                                _sync = sync_group_expiry_list(self.logger)
+                                self.logger.log_info(
+                                    "EXPIRY LIST SYNC ON DEMAND "
+                                    f"groups={_sync.get('groups')} "
+                                    f"with_expiry={_sync.get('with_expiry')} "
+                                    f"expired={_sync.get('expired')} "
+                                    f"orphans_removed={_sync.get('orphans_removed')} "
+                                    f"titles_updated={_sync.get('titles_updated')}"
+                                )
+                            except Exception as error:
+                                self.logger.log_error(
+                                    f"EXPIRY LIST SYNC ON DEMAND FAILED error={error!r}"
+                                )
                             try:
                                 await event.reply(build_expiry_report(self.logger))
                                 self.logger.log_info(
