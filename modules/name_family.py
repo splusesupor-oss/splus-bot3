@@ -340,8 +340,9 @@ def _wikipedia_confirms_category(category, answer, normalized_answer):
 def _web_confirms_category(category, answer, normalized_answer):
     """Use web search only as a final fallback and only trust Wikimedia results."""
     try:
+        quoted_query = f'"{answer}" {category}'
         request = Request(
-            f"{_WEB_SEARCH_URL}?{urlencode({'q': f'\"{answer}\" {category}'})}",
+            f"{_WEB_SEARCH_URL}?{urlencode({'q': quoted_query})}",
             headers={
                 "Accept": "text/html",
                 "User-Agent": "SoroushPlusNameFamily/1.0",
