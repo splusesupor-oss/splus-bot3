@@ -64,6 +64,10 @@ from handlers.message_handler import (
     is_fast_moderation_command,
     is_game_answer_active,
     _resolved_event_peer,
+    enforce_advertising_name,
+    remember_ad_name_group,
+    forget_ad_name_group,
+    handle_ad_name_profile_update,
 )
 from handlers.broadcast_handler import handle_private_broadcast
 from handlers.private_handler import (
@@ -1210,6 +1214,32 @@ class SoroushAntiSpamBot:
                 )
 
 
+        @self.client.on(events.Raw())
+        async def advertising_name_profile_update(update):
+            """نام تازهٔ عضو را بدون انتظار برای پیام بعدی بررسی می‌کند.
+
+            UpdateUserName یک update سراسریِ کاربر است و chat_id ندارد؛ نگاشت
+            گروه از join/پیام‌هایی می‌آید که همین پروسه قبلاً دیده است.
+            """
+            update_type = update.__class__.__name__
+            if update_type not in {"UpdateUserName", "UpdateUser"}:
+                return
+            try:
+                queued = await handle_ad_name_profile_update(self, update)
+                if queued:
+                    self.logger.log_info(
+                        "AD NAME PROFILE UPDATE HANDLED "
+                        f"user_id={getattr(update, 'user_id', None)} "
+                        f"groups={queued} update_type={update_type}"
+                    )
+            except Exception as error:
+                self.logger.log_error(
+                    "AD NAME PROFILE UPDATE FAILED "
+                    f"user_id={getattr(update, 'user_id', None)} "
+                    f"update_type={update_type} error={error!r}"
+                )
+
+
         @self.client.on(events.ChatAction())
         async def group_title_sync(event):
             """🔄 همگام‌سازی خودکار نام گروه‌های ثبت‌شده.
@@ -1250,7 +1280,15 @@ class SoroushAntiSpamBot:
         @self.client.on(events.ChatAction())
         async def banned_join_check(event):
             try:
-                if not event.user_joined and not event.user_added:
+                joined = bool(
+                    getattr(event, "user_joined", False)
+                    or getattr(event, "user_added", False)
+                )
+                left = bool(
+                    getattr(event, "user_left", False)
+                    or getattr(event, "user_kicked", False)
+                )
+                if not joined and not left:
                     return
 
                 user = await event.get_user()
@@ -1258,10 +1296,18 @@ class SoroushAntiSpamBot:
                     return
 
                 chat_id = event.chat_id
+                user_id = user.id
+                if left:
+                    forget_ad_name_group(self, chat_id, user_id)
+                    return
                 if not is_active(chat_id):
                     return
 
-                user_id = user.id
+                remember_ad_name_group(self, chat_id, user_id)
+                if enforce_advertising_name(
+                        self, chat_id, user, source="join"):
+                    return
+
                 username = getattr(user, "username", None)
                 runtime_group, runtime_user = self._spam_state_key((chat_id, user_id))
                 punish_key = f"{runtime_group}:{runtime_user}"

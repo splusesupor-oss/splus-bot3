@@ -714,6 +714,341 @@ def _punishment_key(chat_id, user_id):
     return f"{group_id}:{member_id}"
 
 
+# UpdateUserName فقط user_id دارد و نام گروه را حمل نمی‌کند. عضویت‌هایی که
+# همین پروسه از join یا پیام دیده است روی خود bot نگه داشته می‌شود تا تغییر
+# نام بدون نیاز به یک سیستم موازی moderation به همان guard موجود برسد.
+_AD_NAME_MEMBERSHIP_MAX_USERS = 50_000
+_AD_NAME_HISTORY_SWEEP_LIMIT = 300
+
+
+def remember_ad_name_group(bot, chat_id, user_id):
+    if chat_id is None or user_id is None:
+        return False
+    groups_by_user = getattr(bot, "_ad_name_groups_by_user", None)
+    if groups_by_user is None:
+        groups_by_user = bot._ad_name_groups_by_user = {}
+    user_key = str(user_id)
+    groups = groups_by_user.setdefault(user_key, {})
+    groups[normalize_group_id(chat_id)] = chat_id
+    while len(groups_by_user) > _AD_NAME_MEMBERSHIP_MAX_USERS:
+        groups_by_user.pop(next(iter(groups_by_user)), None)
+    return True
+
+
+def forget_ad_name_group(bot, chat_id, user_id):
+    groups_by_user = getattr(bot, "_ad_name_groups_by_user", {})
+    groups = groups_by_user.get(str(user_id))
+    if not groups:
+        return False
+    removed = groups.pop(normalize_group_id(chat_id), None) is not None
+    if not groups:
+        groups_by_user.pop(str(user_id), None)
+    return removed
+
+
+def ad_name_groups_for_user(bot, user_id):
+    groups = getattr(bot, "_ad_name_groups_by_user", {}).get(str(user_id), {})
+    return tuple(groups.values())
+
+
+def _ad_name_known_message_ids(chat_id, user_id, current_message_id=None):
+    """شناسه‌هایی که دو تاریخچهٔ فعلی پروژه در اختیار دارند."""
+    ids = set(message_tracker.spam_snapshot(chat_id, user_id, current_message_id))
+    ids.update(get_message_ids(chat_id, user_id))
+    if isinstance(current_message_id, int) and current_message_id > 0:
+        ids.add(current_message_id)
+    return {
+        message_id for message_id in ids
+        if isinstance(message_id, int) and message_id > 0
+    }
+
+
+async def _sweep_ad_name_history_ids(bot, chat_id, user_id):
+    """تا سقف تاریخچهٔ قابل پیمایش فعلی، همهٔ پیام‌های همین فرستنده را بیابد.
+
+    SPlusthon در این پروژه API اتمیک «حذف کل تاریخچهٔ یک عضو» ندارد؛ بنابراین
+    فقط IDهای در دسترس ردیاب و حداکثر ۳۰۰ پیام اخیر قابل پیمایش جمع می‌شوند.
+    """
+    iterator_factory = getattr(bot.client, "iter_messages", None)
+    if not callable(iterator_factory):
+        return set()
+    found = set()
+    scanned = 0
+    try:
+        async for message in iterator_factory(
+                chat_id, limit=_AD_NAME_HISTORY_SWEEP_LIMIT, wait_time=1):
+            scanned += 1
+            if not await _same_sender(message, user_id):
+                continue
+            message_id = getattr(message, "id", None)
+            if isinstance(message_id, int) and message_id > 0:
+                found.add(message_id)
+    except _asyncio.CancelledError:
+        raise
+    except Exception as error:
+        bot.logger.log_error(
+            "AD NAME HISTORY SWEEP FAILED "
+            f"chat_id={chat_id} user_id={user_id} scanned={scanned} "
+            f"found={len(found)} error={error!r}"
+        )
+    else:
+        bot.logger.log_info(
+            "AD NAME HISTORY SWEEP FINISHED "
+            f"chat_id={chat_id} user_id={user_id} scanned={scanned} "
+            f"found={len(found)} limit={_AD_NAME_HISTORY_SWEEP_LIMIT}"
+        )
+    return found
+
+
+async def _delete_ad_name_ids(bot, chat_id, user_id, message_ids):
+    requested_ids = sorted({
+        message_id for message_id in (message_ids or ())
+        if isinstance(message_id, int) and message_id > 0
+    })
+    if not requested_ids:
+        return set(), set()
+
+    try:
+        pending = _queue_message_deletes(
+            bot, chat_id, requested_ids, priority=0,
+        )
+        result = await pending if hasattr(pending, "__await__") else pending
+        if isinstance(result, tuple) and len(result) >= 2:
+            deleted_count, remaining = result[0], result[1]
+            remaining_ids = {
+                message_id for message_id in (remaining or ())
+                if isinstance(message_id, int) and message_id > 0
+            }
+        else:
+            deleted_count, remaining_ids = len(requested_ids), set()
+    except _asyncio.CancelledError:
+        raise
+    except Exception as error:
+        deleted_count, remaining_ids = 0, set(requested_ids)
+        bot.logger.log_error(
+            "AD NAME MESSAGE DELETE FAILED "
+            f"chat_id={chat_id} user_id={user_id} "
+            f"requested={len(requested_ids)} error={error!r}"
+        )
+
+    deleted_ids = set(requested_ids) - remaining_ids
+    if deleted_ids:
+        message_tracker.remove_message_ids(chat_id, user_id, deleted_ids)
+        try:
+            add_deleted_count(chat_id, user_id, count=len(deleted_ids))
+        except Exception:
+            pass
+    bot.logger.log_info(
+        "AD NAME MESSAGE DELETE FINISHED "
+        f"chat_id={chat_id} user_id={user_id} requested={len(requested_ids)} "
+        f"deleted={len(deleted_ids)} reported_deleted={deleted_count} "
+        f"remaining={len(remaining_ids)}"
+    )
+    return deleted_ids, remaining_ids
+
+
+async def _ad_name_cleanup_then_punish(
+        bot, chat_id, user_id, user, current_message_id, ad_reason):
+    """ترتیب اجباری: حذف IDهای در دسترس، سپس مجازات موجود گروه."""
+    known_ids = _ad_name_known_message_ids(
+        chat_id, user_id, current_message_id,
+    )
+    deleted, remaining = await _delete_ad_name_ids(
+        bot, chat_id, user_id, known_ids,
+    )
+
+    swept_ids = await _sweep_ad_name_history_ids(bot, chat_id, user_id)
+    extra_ids = swept_ids - known_ids
+    extra_deleted, extra_remaining = await _delete_ad_name_ids(
+        bot, chat_id, user_id, extra_ids,
+    )
+    deleted.update(extra_deleted)
+    remaining.update(extra_remaining)
+
+    if not remaining:
+        message_tracker.clear_user_history(chat_id, user_id)
+        clear_user(chat_id, user_id)
+
+    bot.logger.log_info(
+        "AD NAME CLEANUP BEFORE PUNISHMENT "
+        f"chat_id={chat_id} user_id={user_id} reason={ad_reason!r} "
+        f"known={len(known_ids)} swept={len(swept_ids)} "
+        f"deleted={len(deleted)} remaining={len(remaining)}"
+    )
+    # انتخاب بن/سکوت همچنان فقط در AdminActions.ban_user و punishment_mode است.
+    return await bot.admin_actions.ban_user(
+        chat_id, user_id, reason=f"نام تبلیغاتی ({ad_reason})", user=user,
+    )
+
+
+async def _send_ad_name_notice(bot, event, chat_id, notice, shown_name):
+    name_start = len("⚠️ کاربر\n".encode("utf-16-le")) // 2
+    name_len = len(shown_name.encode("utf-16-le")) // 2
+    bold_len = len("⚠️ کاربر".encode("utf-16-le")) // 2
+    entities = [
+        MessageEntityBold(offset=0, length=bold_len),
+        MessageEntityBlockquote(offset=name_start, length=name_len),
+    ]
+    if event is not None:
+        sender = getattr(bot, "outgoing_sender", None)
+        if sender is not None:
+            sender.enqueue_reply(
+                event, notice, formatting_entities=entities,
+                on_done=lambda sent: capture_sent(bot, chat_id, sent),
+            )
+            return
+        try:
+            sent = await event.reply(notice, formatting_entities=entities)
+        except Exception:
+            sent = await event.reply(notice)
+    else:
+        try:
+            sent = await bot.client.send_message(
+                chat_id, notice, formatting_entities=entities,
+            )
+        except Exception:
+            sent = await bot.client.send_message(chat_id, notice)
+    capture_sent(bot, chat_id, sent)
+
+
+def enforce_advertising_name(
+        bot, chat_id, user, *, event=None, current_message_id=None,
+        source="message"):
+    """همان مجازات نام تبلیغاتی را برای پیام، ورود و تغییر نام صف‌بندی کند."""
+    if user is None or chat_id is None:
+        return False
+    user_id = getattr(user, "id", None)
+    if user_id is None or is_global_owner(user_id):
+        return False
+    username = (getattr(user, "username", None) or "").lstrip("@").lower()
+    if admin_tools.has_admin_permission(chat_id, user_id, username):
+        return False
+
+    ad_reason = ad_name_detector.reason(user)
+    if not ad_reason:
+        return False
+
+    punished_users = getattr(bot, "punished_users", None)
+    if punished_users is None:
+        punished_users = bot.punished_users = set()
+    punish_key = _punishment_key(chat_id, user_id)
+    if punish_key in punished_users:
+        # تا پایان RPC مجازات ممکن است چند NewMessage دیگر برسد. هر پیام
+        # تازه باید مستقل از job اول فوراً وارد صف حذف شود و روی گروه نماند.
+        if isinstance(current_message_id, int) and current_message_id > 0:
+            _queue_message_deletes(
+                bot, chat_id, [current_message_id], priority=0,
+            )
+        bot.logger.log_info(
+            "AD NAME INCIDENT DUPLICATE SKIPPED "
+            f"chat_id={chat_id} user_id={user_id} source={source} "
+            f"message_id={current_message_id} delete_queued="
+            f"{isinstance(current_message_id, int) and current_message_id > 0}"
+        )
+        return True
+    punished_users.add(punish_key)
+
+    shown_name = ad_name_detector.display_name(user)
+    action_label = "سکوت دائم" if punishment_mode.is_mute(chat_id) else "اخراج"
+    notice = (
+        "⚠️ کاربر\n"
+        f"{shown_name}\n\n"
+        f"به دلیل داشتن نام تبلیغاتی {action_label} شد."
+    )
+
+    async def succeeded(_result):
+        await _send_ad_name_notice(bot, event, chat_id, notice, shown_name)
+        bot.logger.log_info(
+            "AD NAME ACTION FINISHED "
+            f"chat_id={chat_id} user_id={user_id} source={source} "
+            f"reason={ad_reason!r} action={action_label!r}"
+        )
+
+    async def failed(error):
+        punished_users.discard(punish_key)
+        bot.logger.log_error(
+            "AD NAME ACTION FAILED "
+            f"chat_id={chat_id} user_id={user_id} source={source} "
+            f"reason={ad_reason!r} error={error!r}"
+        )
+
+    queued = bot.moderation_queue.enqueue(
+        chat_id,
+        "ban",
+        user_id=user_id,
+        timeout_seconds=180,
+        operation=lambda: _ad_name_cleanup_then_punish(
+            bot, chat_id, user_id, user, current_message_id, ad_reason,
+        ),
+        on_success=succeeded,
+        on_failure=failed,
+    )
+    if not queued:
+        punished_users.discard(punish_key)
+        bot.logger.log_info(
+            "AD NAME INCIDENT QUEUE DUPLICATE "
+            f"chat_id={chat_id} user_id={user_id} source={source}"
+        )
+    else:
+        bot.logger.log_info(
+            "AD NAME ACTION QUEUED "
+            f"chat_id={chat_id} user_id={user_id} source={source} "
+            f"name={shown_name!r} reason={ad_reason!r}"
+        )
+    return True
+
+
+async def handle_ad_name_profile_update(bot, update):
+    """UpdateUserName/UpdateUser را روی گروه‌های دیده‌شدهٔ همین عضو اعمال کند."""
+    user_id = getattr(update, "user_id", None)
+    if user_id is None:
+        user_id = getattr(getattr(update, "user", None), "id", None)
+    if user_id is None:
+        return 0
+
+    # UpdateUserName معمولاً هر سه فیلد را دارد؛ همان payload تازه از cache
+    # معتبرتر است. UpdateUser عمومی در صورت نبود فیلد با یک get_entity تکمیل می‌شود.
+    has_name_payload = any(
+        hasattr(update, field)
+        for field in ("first_name", "last_name", "username", "usernames")
+    )
+    if has_name_payload:
+        user = type("UpdatedAdNameUser", (), {})()
+        user.id = user_id
+        user.first_name = getattr(update, "first_name", None)
+        user.last_name = getattr(update, "last_name", None)
+        user.username = getattr(update, "username", None)
+        # Schemaهای جدید SPlusthon به جای username یک لیست TypeUsername
+        # می‌فرستند؛ اولین نام فعال همان نام کاربری فعلی برای بررسی است.
+        if not user.username:
+            for username_row in (getattr(update, "usernames", None) or ()):
+                if getattr(username_row, "active", True) is False:
+                    continue
+                candidate = getattr(username_row, "username", None)
+                if candidate:
+                    user.username = candidate
+                    break
+    else:
+        try:
+            user = await bot.client.get_entity(user_id)
+        except Exception as error:
+            bot.logger.log_error(
+                f"AD NAME PROFILE UPDATE RESOLVE FAILED user_id={user_id} error={error!r}"
+            )
+            return 0
+
+    if not ad_name_detector.reason(user):
+        return 0
+    queued = 0
+    for chat_id in ad_name_groups_for_user(bot, user_id):
+        if not is_active(chat_id):
+            continue
+        if enforce_advertising_name(
+                bot, chat_id, user, source="profile_update"):
+            queued += 1
+    return queued
+
+
 def finalize_spam_wave(chat_id, user_id, requested, deleted, remaining):
     """Clear both spam histories only after complete cleanup."""
     if remaining or deleted != requested:
@@ -3102,6 +3437,11 @@ async def handle_new_message(bot, event):
             except Exception:
                 pass
 
+        if not getattr(event, "is_private", False):
+            # UpdateUserName نام گروه را حمل نمی‌کند؛ این ارتباط از پیام/ورود
+            # فعلی برای handler تغییر نام نگه داشته می‌شود.
+            remember_ad_name_group(bot, chat_id, user_id)
+
         # Big-spam incidents are the sole opt-in per-message ID registry.
         # Capture before any later return/lock branch can race this event.
         _capture_big_spam_message(
@@ -3132,8 +3472,6 @@ async def handle_new_message(bot, event):
             _get_forward_metadata(event.message, event)
         )
         is_gif_media = is_gif_message(event.message)
-        if not has_text_content and not is_forwarded_media and not is_gif_media:
-            return
 
         sender_username = (getattr(sender, "username", None) or "").lstrip("@").lower()
         # Current group authority is checked before every spam cache, banned
@@ -3243,6 +3581,19 @@ async def handle_new_message(bot, event):
                 f"message_id={getattr(event.message, 'id', None)} "
                 f"history_size_after_add={len(message_tracker.get_user_recent_messages(chat_id, user_id))}"
             )
+
+        # همان guard قدیمی نام تبلیغاتی، اکنون پیش از همهٔ moderationهای متن
+        # اجرا می‌شود تا پیام فعلی هم در snapshot باشد و قبل از مجازات پاک شود.
+        # فرمان، رسانهٔ بدون کپشن و ترکیب نام+اسپم نیز دیگر راه فرار نیستند.
+        if (sender and not event.is_private
+                and not native_admin_warn_only
+                and enforce_advertising_name(
+                    bot, chat_id, sender, event=event,
+                    current_message_id=getattr(event.message, "id", None),
+                    source="message",
+                )):
+            return
+
         # Banned words run before the spam/burst filter so obfuscated
         # forms map to the original listed word, not to generic flood.
         banned_precheck = False
@@ -3348,119 +3699,6 @@ async def handle_new_message(bot, event):
                 f"chat_id={chat_id} user_id={user_id} message_id={event.message.id}")
             return
         profiler.mark("RECEIVE")
-        # Independent advertising-name guard: runs before text moderation and
-        # never contributes a warning or banned-word record.
-        command_priority = normalize_command(message_text) in {
-            "راهنما", "لیست بازی", "لیست بازی ها", "لیست بازی‌ها",
-            "لیست ادمین", "لیست ادمینی", "لیست کاربران", "رتبه ها", "رتبه‌ها",
-            "موجودی", "فروشگاه", "انتقال سکه", "قفل", "باز", "اخطار",
-            "حدس ایموجی", "حدس جمله", "ساخت جمله", "معما", "حدس پرچم",
-            "مین یاب", "سابقه ها", "سابقه‌ها", "سطح گروه",
-            "فعال", "غیر فعال", "فعال سازی",
-            "ثبت مالک", "لغو مالک", "برکناری مالک",
-            "ثبت گروه", "حذف گروه",
-            "۵ روز", "یک هفته", "دو هفته", "یک ماه",
-        }
-        if (sender and not event.is_private and not command_priority
-                and not is_global_owner(user_id)
-                and not native_admin_warn_only):
-            if not admin_tools.has_admin_permission(chat_id, user_id, sender_username):
-                ad_reason = ad_name_detector.reason(sender)
-                if ad_reason:
-                    # Claim the incident before any await. A burst can produce
-                    # several NewMessage events before the kick RPC completes;
-                    # only its first event may queue the ban or later notify.
-                    punish_key = _punishment_key(chat_id, user_id)
-                    if punish_key in bot.punished_users:
-                        bot.logger.log_info(
-                            "AD NAME INCIDENT DUPLICATE SKIPPED "
-                            f"chat_id={chat_id} user_id={user_id} "
-                            f"message_id={getattr(event.message, 'id', None)}"
-                        )
-                        return
-                    bot.punished_users.add(punish_key)
-                    shown_name = ad_name_detector.display_name(sender)
-                    if punishment_mode.is_mute(chat_id):
-                        ad_action_line = "به دلیل داشتن نام تبلیغاتی و لینک سکوت دائم شد."
-                    else:
-                        ad_action_line = "به دلیل داشتن نام تبلیغاتی و لینک اخراج شد."
-                    notice = (
-                        "⚠️ کاربر\n"
-                        f"{shown_name}\n\n"
-                        f"{ad_action_line}"
-                    )
-
-                    async def ad_name_ban_succeeded(_result):
-                        # The announcement is deliberately after the real ban
-                        # succeeds, and is owned by this one incident only.
-                        sender3 = getattr(bot, "outgoing_sender", None)
-                        if sender3 is not None:
-                            # Use outgoing queue so this notice does not block moderation worker
-                            try:
-                                name_start = len("⚠️ کاربر\n".encode("utf-16-le")) // 2
-                                name_len = len(shown_name.encode("utf-16-le")) // 2
-                                bold_len = len("⚠️ کاربر".encode("utf-16-le")) // 2
-                                entities = [
-                                    MessageEntityBold(offset=0, length=bold_len),
-                                    MessageEntityBlockquote(offset=name_start, length=name_len),
-                                ]
-                                sender3.enqueue_reply(event, notice, formatting_entities=entities, on_done=lambda sent: capture_sent(bot, chat_id, sent))
-                            except Exception:
-                                sender3.enqueue_reply(event, notice, on_done=lambda sent: capture_sent(bot, chat_id, sent))
-                        else:
-                            try:
-                                name_start = len("⚠️ کاربر\n".encode("utf-16-le")) // 2
-                                name_len = len(shown_name.encode("utf-16-le")) // 2
-                                bold_len = len("⚠️ کاربر".encode("utf-16-le")) // 2
-                                sent = await event.reply(notice, formatting_entities=[
-                                    MessageEntityBold(offset=0, length=bold_len),
-                                    MessageEntityBlockquote(
-                                        offset=name_start, length=name_len
-                                    ),
-                                ])
-                            except Exception:
-                                sent = await event.reply(notice)
-                            capture_sent(bot, chat_id, sent)
-                        bot.logger.log_info(
-                            "AD NAME BAN FINISHED "
-                            f"chat_id={chat_id} user_id={user_id} "
-                            f"reason={ad_reason!r} notification_sent=True"
-                        )
-
-                    async def ad_name_ban_failed(error):
-                        # A failed RPC must be retryable by a later event; it
-                        # must not leave a permanent in-memory incident lock.
-                        bot.punished_users.discard(punish_key)
-                        bot.logger.log_error(
-                            "AD NAME BAN FAILED "
-                            f"chat_id={chat_id} user_id={user_id} error={error!r}"
-                        )
-
-                    queued = bot.moderation_queue.enqueue(
-                        chat_id,
-                        "ban",
-                        user_id=user_id,
-                        timeout_seconds=45,
-                        operation=lambda: bot.admin_actions.ban_user(
-                            chat_id, user_id, reason="نام تبلیغاتی",
-                            user=sender,
-                        ),
-                        on_success=ad_name_ban_succeeded,
-                        on_failure=ad_name_ban_failed,
-                    )
-                    if not queued:
-                        bot.punished_users.discard(punish_key)
-                        bot.logger.log_info(
-                            "AD NAME INCIDENT QUEUE DUPLICATE "
-                            f"chat_id={chat_id} user_id={user_id}"
-                        )
-                    else:
-                        bot.logger.log_info(
-                            "AD NAME BAN QUEUED "
-                            f"chat_id={chat_id} user_id={user_id} "
-                            f"name={shown_name!r} reason={ad_reason!r}"
-                        )
-                    return
         # حساب سشن نباید وارد activity، فیلتر یا مجازات شود. با این حال، در
         # معماری userbot مالک همان حساب برای صدور فرمان عمومی استفاده می‌کند.
         # پیش‌تر این گیتِ دوم، فرمانی را که از گیت اول عبور کرده بود دوباره
