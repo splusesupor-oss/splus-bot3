@@ -136,6 +136,7 @@ from modules.outgoing_profiler import (
 from handlers.admin_handler import handle_admin_commands
 from modules import admin_tools
 from modules import entertainment_control
+from modules import clipboard
 from modules.group_dispatch import PRIORITY_ADMIN, classify_priority
 # 🗂 سیستم سابقه‌ها و 🏆 سطح گروه — دو قابلیتِ مستقل با فایل و ماژولِ جدا.
 from modules import user_history
@@ -3488,6 +3489,32 @@ async def handle_new_message(bot, event):
         # COMMAND_MATCH is the cheap text classify only — never include
         # get_entity / search / economy time in this stage.
         profiler.mark("COMMAND_MATCH")
+
+        # ------------------------------------------------------------------
+        # 📮 کپی بورد — فقط مالک ثبت‌شده/ادمین ربات. پاسخِ ذخیره فقط وقتی
+        # پذیرفته می‌شود که دقیقاً روی پیام راهنمای ساخته‌شده توسط همین
+        # گروه reply شده باشد؛ هیچ متن عادی وارد Clipboard نمی‌شود.
+        # ------------------------------------------------------------------
+        clipboard_candidate = clean_text in clipboard.COMMANDS
+        if not clipboard_candidate and not getattr(event, "is_private", False):
+            clipboard_candidate = clipboard.is_reply_to_pending_guide(chat_id, event)
+        if clipboard_candidate:
+            clipboard_authorized = (
+                not getattr(event, "is_private", False)
+                and _has_group_management_permission(
+                    bot, chat_id, user_id, getattr(sender, "username", None)
+                )
+            )
+            if await clipboard.handle_message(
+                bot,
+                event,
+                chat_id,
+                user_id,
+                clean_text,
+                authorized=clipboard_authorized,
+            ):
+                return
+
         # 📢 مسیر گروهی اطلاع‌رسانی: فقط مالک اصلی ربات؛ همان workflow پیوی.
         # قبل از هر هندلر دیگری چک می‌شود تا بدنهٔ اطلاعیه (متن آزاد) توسط
         # بازی/حافظه/جستجو بلعیده نشود. برای بقیهٔ کاربران فقط یک مقایسهٔ
@@ -3506,7 +3533,7 @@ async def handle_new_message(bot, event):
             "راهنما", "لیست بازی", "لیست بازی ها", "لیست بازی‌ها",
             "لیست ادمین", "لیست ادمینی", "لیست کاربران", "رتبه ها", "رتبه‌ها",
             "موجودی", "فروشگاه", "انتقال سکه", "قفل", "باز", "اخطار",
-            "سابقه ها", "سابقه‌ها", "سطح گروه",
+            "سابقه ها", "سابقه‌ها", "سطح گروه", "کپی بورد", "کپی",
         }
         _debug_log(
             bot,
@@ -5487,6 +5514,12 @@ async def handle_new_message(bot, event):
                 "🎮 برای روشن کردن بازی های روباه\n\n"
                 "سرگرمی فعال"
             )
+            # این بخش طبق درخواست باید یک‌جا Bold و داخل نقل‌قول سروش باشد.
+            clipboard_help_block = (
+                "📮کپی بورد حافظه روباهی\n\n"
+                "برای ایجاد بنویسید کپی بورد\n\n"
+                "برای نمایش پیام بنویس کپی"
+            )
             full_help_text = (
                 "📌 راهنمای روباه\n\n"
 
@@ -5587,6 +5620,8 @@ async def handle_new_message(bot, event):
 
                 "👑 دستورات ادمین‌ها:\n\n"
                 + entertainment_help_block
+                + "\n\n"
+                + clipboard_help_block
                 + "\n\n"
                 + "دیدن لیست ادمین‌ها\n"
                 "بنویسید:\n"
@@ -5800,6 +5835,8 @@ async def handle_new_message(bot, event):
                 # کنترل سرگرمی — دو عنوان Bold
                 "🎮 برای خاموش کردن بازی های عمومی",
                 "🎮 برای روشن کردن بازی های روباه",
+                # کل راهنمای کپی بورد باید Bold باشد.
+                clipboard_help_block,
                 "دیدن لیست ادمین‌ها",
                 "برای سنجاق کردن پیام",
                 "برای نمایش پیام سنجاق‌شده",
@@ -5892,6 +5929,8 @@ async def handle_new_message(bot, event):
                 "لیست ادمینی",
                 # کنترل سرگرمی — کل بخش داخل یک نقل‌قول شیشه‌ای یکپارچه.
                 entertainment_help_block,
+                # کل راهنمای کپی بورد نیز طبق درخواست Bold + نقل‌قول است.
+                clipboard_help_block,
                 # کل بخش قوانین گروه باید یک نقل قول شیشه‌ای یکپارچه باشد.
                 "📜 قوانین گروه (مدیر)\n"
                 "ثبت قوانین  |  قوانین  |  حذف قوانین\n\n"
