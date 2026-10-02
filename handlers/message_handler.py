@@ -924,7 +924,9 @@ def enforce_advertising_name(
     if admin_tools.has_admin_permission(chat_id, user_id, username):
         return False
 
-    ad_reason = ad_name_detector.reason(user)
+    # فیلترهای نامی که ادمین برای گروه ثبت کرده نیز با همین detector و
+    # همین صف حذف/مجازات بررسی می‌شوند؛ هیچ مسیر moderation جدا ندارند.
+    ad_reason = ad_name_detector.reason(user, chat_id=chat_id)
     if not ad_reason:
         return False
 
@@ -1037,11 +1039,14 @@ async def handle_ad_name_profile_update(bot, update):
             )
             return 0
 
-    if not ad_name_detector.reason(user):
-        return 0
+    # فیلترهای سفارشی به تفکیک گروه هستند؛ بنابراین نمی‌توان یک‌بار بیرون
+    # حلقه reason(user) را چک کرد. هر عضویت فعال با همان detector بررسی
+    # می‌شود و فقط گروه match‌شده وارد صف مجازات موجود می‌شود.
     queued = 0
     for chat_id in ad_name_groups_for_user(bot, user_id):
         if not is_active(chat_id):
+            continue
+        if not ad_name_detector.reason(user, chat_id=chat_id):
             continue
         if enforce_advertising_name(
                 bot, chat_id, user, source="profile_update"):
@@ -2892,6 +2897,14 @@ ADMIN_PERMISSION_CACHE_TTL_SECONDS = 45
 ADMIN_PERMISSION_CACHE_MAX_ENTRIES = 4000
 
 
+def _has_registered_name_filter_permission(chat_id, user_id, username):
+    """مجوز سخت‌گیرانهٔ «فیلتر اسم»: فقط مالک/ادمینِ ثبت‌شدهٔ همان گروه."""
+    group_owner_id = get_group_owner(chat_id)
+    if group_owner_id is not None and str(user_id) == str(group_owner_id):
+        return True
+    return is_admin(chat_id, user_id, username)
+
+
 def _has_group_management_permission(bot, chat_id, user_id, username):
     normalized_username = (username or "").lstrip("@").lower()
     cache_key = (chat_id, user_id, normalized_username)
@@ -3727,6 +3740,27 @@ async def handle_new_message(bot, event):
         # COMMAND_MATCH is the cheap text classify only — never include
         # get_entity / search / economy time in this stage.
         profiler.mark("COMMAND_MATCH")
+
+        # ------------------------------------------------------------------
+        # 🪪 فیلتر اسم — storage و normalizer همان ad_name_detector است و
+        # permission فقط از مالک/ادمین ثبت‌شدهٔ همان گروه خوانده می‌شود.
+        # ------------------------------------------------------------------
+        name_filter_command = ad_name_detector.parse_filter_command(clean_text)
+        if name_filter_command is not None:
+            name_filter_authorized = (
+                not getattr(event, "is_private", False)
+                and _has_registered_name_filter_permission(
+                    chat_id, user_id, getattr(sender, "username", None)
+                )
+            )
+            if await ad_name_detector.handle_filter_command(
+                event,
+                chat_id,
+                clean_text,
+                authorized=name_filter_authorized,
+                is_private=getattr(event, "is_private", False),
+            ):
+                return
 
         # ------------------------------------------------------------------
         # 📮 کپی بورد — فقط مالک ثبت‌شده/ادمین ربات. پاسخِ ذخیره فقط وقتی
@@ -5758,6 +5792,14 @@ async def handle_new_message(bot, event):
                 "برای ایجاد بنویسید کپی بورد\n\n"
                 "برای نمایش پیام بنویس کپی"
             )
+            # دستورهای فیلتر نام یک بلوک پیوسته‌اند؛ کل بلوک Bold و Quote است.
+            name_filter_help_block = (
+                "برای فیلتر اسم یک کاربر\n"
+                "بنویسید فیلتر اسم بعد نام را بنویسید\n"
+                "برای لغو بنویسید\n"
+                "لغو اسم بعد اسم را بنویسید\n"
+                "بدون اینکه از هم فاصله بگیرین یا انتر بخورن"
+            )
             full_help_text = (
                 "📌 راهنمای روباه\n\n"
 
@@ -5860,6 +5902,8 @@ async def handle_new_message(bot, event):
                 + entertainment_help_block
                 + "\n\n"
                 + clipboard_help_block
+                + "\n\n"
+                + name_filter_help_block
                 + "\n\n"
                 + "دیدن لیست ادمین‌ها\n"
                 "بنویسید:\n"
@@ -6075,6 +6119,8 @@ async def handle_new_message(bot, event):
                 "🎮 برای روشن کردن بازی های روباه",
                 # کل راهنمای کپی بورد باید Bold باشد.
                 clipboard_help_block,
+                # راهنمای فیلتر نام نیز باید به‌صورت یک‌پارچه Bold باشد.
+                name_filter_help_block,
                 "دیدن لیست ادمین‌ها",
                 "برای سنجاق کردن پیام",
                 "برای نمایش پیام سنجاق‌شده",
@@ -6169,6 +6215,8 @@ async def handle_new_message(bot, event):
                 entertainment_help_block,
                 # کل راهنمای کپی بورد نیز طبق درخواست Bold + نقل‌قول است.
                 clipboard_help_block,
+                # راهنمای فیلتر نام نیز یک نقل‌قول شیشه‌ای یکپارچه است.
+                name_filter_help_block,
                 # کل بخش قوانین گروه باید یک نقل قول شیشه‌ای یکپارچه باشد.
                 "📜 قوانین گروه (مدیر)\n"
                 "ثبت قوانین  |  قوانین  |  حذف قوانین\n\n"

@@ -466,6 +466,25 @@ def test_admin_help_still_works():
     check("entity دارد", len(entities) > 0)
 
 
+def test_admin_help_includes_group_name_filter_instruction():
+    print("\n### 📌 راهنمای فیلتر اسم در لیست ادمینی")
+    text, entities = _help_output("لیست ادمینی")
+    instruction = (
+        "برای فیلتر اسم یک کاربر\n"
+        "بنویسید فیلتر اسم بعد نام را بنویسید\n"
+        "برای لغو بنویسید\n"
+        "لغو اسم بعد اسم را بنویسید\n"
+        "بدون اینکه از هم فاصله بگیرین یا انتر بخورن"
+    )
+    check("متن دقیق راهنما هست", instruction in text)
+    bolds = {_decode(text, entity) for entity in entities
+             if entity.__class__.__name__ == "MessageEntityBold"}
+    quotes = {_decode(text, entity) for entity in entities
+              if entity.__class__.__name__ == "MessageEntityBlockquote"}
+    check("کل راهنما Bold است", instruction in bolds)
+    check("کل راهنما داخل نقل‌قول است", instruction in quotes)
+
+
 # ===========================================================================
 def main():
     test_persian_profanity_blocked()
@@ -497,6 +516,7 @@ def main():
     test_help_uses_no_markdown()
     test_help_entities_are_valid()
     test_admin_help_still_works()
+    test_admin_help_includes_group_name_filter_instruction()
     print(f"\npassed={PASSED} failed={FAILED}")
     return 1 if FAILED else 0
 
