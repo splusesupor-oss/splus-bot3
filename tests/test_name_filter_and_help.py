@@ -473,10 +473,13 @@ def test_admin_help_includes_group_name_filter_instruction():
         "برای فیلتر اسم یک کاربر\n"
         "بنویسید فیلتر اسم بعد نام را بنویسید\n"
         "برای لغو بنویسید\n"
-        "لغو اسم بعد اسم را بنویسید\n"
-        "بدون اینکه از هم فاصله بگیرین یا انتر بخورن"
+        "لغو اسم بعد اسم را بنویسید\n\n"
+        "برای دیدن لیست اسم ها\n"
+        "لیست فیلتر اسم"
     )
     check("متن دقیق راهنما هست", instruction in text)
+    check("دستور داخلیِ قبلی در راهنما نیست",
+          "بدون اینکه از هم فاصله بگیرین یا انتر بخورن" not in text)
     bolds = {_decode(text, entity) for entity in entities
              if entity.__class__.__name__ == "MessageEntityBold"}
     quotes = {_decode(text, entity) for entity in entities
