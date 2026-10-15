@@ -34,6 +34,17 @@ os.environ["BOT_INSTANCE"] = "bot3"
 
 import asyncio
 
+# گارد جداسازی: اگر این clone نشانگر bot3 نداشته باشد (یعنی launcher داخل
+# مخزن ربات دیگری افتاده باشد) اجرا با پیام روشن متوقف می‌شود، نه اینکه
+# تصادفی داخل دایرکتوری داده‌ی ربات ۱ یا ۲ بنویسد.
+from modules import instance_guard
+try:
+    instance_guard.resolve("bot3.py", instance="bot3")
+except instance_guard.InstanceConflict as _conflict:
+    import sys
+    sys.stderr.write(str(_conflict) + "\n")
+    sys.exit(2)
+
 # import AFTER تعیین instance: بدنه‌ی main.py (تعیین dotenv و importهای
 # پروجه) حالا با BOT_INSTANCE=bot3 اجرا می‌شود. بلاک if __name__ ==
 # "__main__" در main.py هنگام import اجرا نمی‌شود.

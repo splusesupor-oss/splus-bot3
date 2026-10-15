@@ -30,6 +30,17 @@ os.environ.setdefault("BOT_INSTANCE", _default_instance())
 from dotenv import load_dotenv
 load_dotenv(override=False)
 
+from modules import instance_guard  # noqa: E402  (بعد از تعیین instance)
+
+# گارد جداسازی: تناقض بین محیط/لانچر/نشانگر = توقف روشن، نه ادامه‌ی خطرناک.
+# اگر کسی داخل همین clone با BOT_INSTANCE=main/bot2 اجرا کند، هیچ‌چیز استارت
+# نمی‌شود و هیچ داده‌ای از ربات دیگر خوانده/نوشته نمی‌شود.
+try:
+    _INSTANCE = instance_guard.resolve("main.py")
+except instance_guard.InstanceConflict as _conflict:
+    sys.stderr.write(str(_conflict) + "\n")
+    sys.exit(2)
+
 from core.bot_working_split_ok import SoroushAntiSpamBot
 from modules.time_utils import TEHRAN, now_local
 import asyncio
