@@ -45,7 +45,14 @@ def _instance_name() -> str:
     در مجاورت همان مسیر، دایرکتوری مستقل می‌گیرد:
     ``~/.local/share/soroush-bot-<instance>/``
     """
-    raw = os.environ.get("BOT_INSTANCE", "main").strip() or "main"
+    raw = os.environ.get("BOT_INSTANCE", "").strip()
+    if not raw:
+        try:
+            raw = (PROJECT_ROOT / ".bot_instance").read_text(
+                encoding="utf-8").strip()
+        except OSError:
+            raw = ""
+    raw = raw or "main"
     slug = re.sub(r"[^A-Za-z0-9._-]", "_", raw)[:32]
     return slug or "main"
 

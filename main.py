@@ -2,10 +2,28 @@ import os
 import sys
 import atexit
 
-# launcher این instance: main — BOT_INSTANCE باید قبل از هر import پروجه
-# (و قبل از لود شدن .env) قط‌ی شود: modules/runtime_paths در زمان
-# import مقدارهای INSTANCE_NAME/DATA_DIR را از حمین متگیر می‌سازد.
-os.environ.setdefault("BOT_INSTANCE", "main")
+# launcher این clone — BOT_INSTANCE باید قبل از هر import پروژه
+# (و قبل از لود شدن .env) قطعی شود: modules/runtime_paths در زمان
+# import مقدارهای INSTANCE_NAME/DATA_DIR را از همین متغیر می‌سازد.
+#
+# ⚠️ این clone ربات ۳ است. نام instance از فایل نشانگر `.bot_instance` کنار
+# همین فایل خوانده می‌شود تا اجرای مستقیم `python3 main.py` یا
+# `./run.sh` (که watchdog.py را اجرا می‌کند) هرگز به runtime ربات ۱ برنگردد
+# و تصادفاً داخل دایرکتوری داده‌ی آن ننویسد.
+def _default_instance():
+    marker = os.path.join(os.path.dirname(os.path.abspath(__file__)),
+                          ".bot_instance")
+    try:
+        with open(marker, "r", encoding="utf-8") as fh:
+            name = fh.read().strip()
+        if name:
+            return name
+    except OSError:
+        pass
+    return "main"
+
+
+os.environ.setdefault("BOT_INSTANCE", _default_instance())
 
 # .env باید قبل از هر import پروجه لود شود (override=False معنی
 # متگیرهای محیتهای فعلی — از جمله BOT_INSTANCE بالا — بر .env برتری دارند).
